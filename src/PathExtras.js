@@ -1,30 +1,27 @@
+// Receives [x, y]
+// Returns "123.4 567.8"
+function coordsToString(coords) {
+  return coords.map(v => v.toFixed(1)).join(",");
+}
+
 function coordsToPath(points) {
-  let pathStr = "";
-
-  for (let point of points) {
-    if (pathStr == "") {
-      pathStr += "M";
-    } else {
-      pathStr += "L";
-    }
-    pathStr += `${point[0]} ${point[1]} `;
+  if (points.length == 0) {
+    return "";
+  } else if (points.length == 1) {
+    return `M${coordsToString(points[0])}Z`;
+  } else {
+    return points.map((coords, index) =>
+        `${index == 0 ? "M" : "L"}${coordsToString(coords)}`
+    ).join("");
   }
-
-  return pathStr.trim();
 }
 
 function pathToCoords(pathStr) {
-  let commands = pathStr.split(/(?=[LMC])/);
+  let commands = pathStr.split(/(?= *[LMCZ] *)/);
   let points = commands.map(function (point) {
-    if (point !== " ") {
-      // If the string doesn't have a space at the end, add it
-      // Usefule for the last coords
-      if (point[point.length - 1] != " ") {
-        point += " ";
-      }
-
+    if (point.trim()) {
       // Trim the path string and convert it
-      let coords = point.slice(1, -1).split(" ");
+      let coords = point.trim().slice(1).split(/[ ,]/);
 
       // Convert the coords to a float
       coords[0] = parseFloat(coords[0]);

@@ -1,5 +1,3 @@
-import * as d3 from "d3";
-import { path } from "d3";
 import MathExtas from "./MathExtras.js";
 import PathExtras from "./PathExtras.js";
 
@@ -21,6 +19,9 @@ const defEraserParam = {
 const defStrokeStyles = {
   stroke: "black",
   "stroke-width": "1px",
+  "stroke-linecap": "round",
+  "stroke-linecap": "round",
+  "stroke-linejoin": "round",
 };
 
 const defEraserStyles = {
@@ -29,7 +30,130 @@ const defEraserStyles = {
   fill: "rgba(0,0,0, 0.5)",
 };
 
+class PointerState {
+  pointerId;
+  pointerType;
+  button;
+  buttonName;
+  actionName;
+  action;
+
+  constructor(pointerEvent) {
+    this.pointerId = pointerEvent.pointerId;
+    this.pointerType = pointerEvent.pointerType;
+    this.button = pointerEvent.button;
+    this.buttonName = {
+      // https://www.w3.org/TR/pointerevents/#the-button-property
+      0: "normal",  // Mouse Left   , Pen Tip   , Touch contact
+      1: "middle",  // Mouse Middle
+      2: "right",   // Mouse Right  , Pen Barrel
+      3: "back",    // Mouse Back
+      4: "forward", // Mouse Forward
+      5: "eraser",  // (no mouse)   , Pen Eraser
+    }[this.button];
+    this.actionName = {
+      "normal": "drawing",
+      "right" : "erasing",
+      "eraser": "erasing",
+    }[this.buttonName];
+    this.action = null;
+  }
+}
+
+class BaseAction {
+  coords;
+  constructor() {
+    this.coords = [];
+  }
+}
+class DrawingAction extends BaseAction {
+  svgPenSketch;
+  svgPath;
+  constructor(svgPenSketch) {
+    super();
+    this.svgPenSketch = svgPenSketch;
+    this.svgPath = null;
+  }
+  start(pointerState, ev) {
+    this.svgPath = this.svgPenSketch._createPath();
+    this._appendMouseCoord(pointerState, ev);
+  }
+  move(pointerState, ev) {
+    this._appendMouseCoord(pointerState, ev);
+  }
+  stop(pointerState, ev) {
+  }
+  _appendMouseCoord(pointerState, ev) {
+    const [x, y] = this.svgPenSketch._getMousePos(ev);
+    this.coords.push([x, y]);
+    this.svgPath.setAttribute("d", this.svgPenSketch.strokeParam.lineFunc(this.coords));
+    // TODO: Consider implementing variable stroke width based on the pressure.
+    // This can be implemented by having an outer `<g>` element with multiple `<path>` inside, each one with a different stroke-width.
+    // this.svgPath.style.strokeWidth = (10 * ev.pressure).toFixed(1) + "px";
+  }
+}
+
+class ErasingAction extends BaseAction {
+  svgPenSketch;
+  constructor(svgPenSketch) {
+    super();
+    this.svgPenSketch = svgPenSketch;
+  }
+  start(pointerState, ev) {
+    const [x, y] = this.svgPenSketch._getMousePos(ev);
+    //this.coords.push([x, y]);
+    this.svgPenSketch._createEraserHandle(x, y);
+  }
+  move(pointerState, ev) {
+    const [x, y] = this.svgPenSketch._getMousePos(ev);
+    let affectedPaths = null;
+
+    // Move the eraser cursor
+    this.svgPenSketch._moveEraserHandle(x, y);
+
+    // Add the points
+    //this.coords.push([x, y]);
+
+    switch (this.svgPenSketch.eraserParam.eraserMode) {
+      case "object":
+        // Remove any paths in the way
+        affectedPaths = this.svgPenSketch.removePaths(
+          x,
+          y,
+          this.svgPenSketch.eraserParam.eraserSize / 2
+        );
+        break;
+      case "pixel":
+        affectedPaths = this.svgPenSketch.erasePaths(
+          x,
+          y,
+          this.svgPenSketch.eraserParam.eraserSize / 2
+        );
+        break;
+      default:
+        console.error("ERROR: INVALID ERASER MODE");
+        break;
+    }
+
+  }
+  stop(pointerState, ev) {
+    this.svgPenSketch._removeEraserHandle();
+  }
+}
+
 export default class SvgPenSketch {
+  _element;
+  _pointers;
+  parentScale;
+  strokeParam;
+  strokeStyles;
+  eraserParam;
+  eraserStyles;
+  penDownCallback;
+  penUpCallback;
+  eraserDownCallback;
+  eraserUpCallback;
+
   constructor(
     element = null,
     strokeStyles = {},
@@ -38,34 +162,23 @@ export default class SvgPenSketch {
     eraserStyles = {}
   ) {
     // If the element is a valid
-    if (element != null && typeof element === "object" && element.nodeType) {
+    if (element && typeof element === "object" && element.nodeType === Node.ELEMENT_NODE) {
       // Private variables
       // The root SVG element
-      this._element = d3.select(element);
-      // Variable for if the pointer event is a pen
-      this._isPen = false;
+      this._element = element;
+      // Map of active pointers
+      this._pointers = {};
+
       // Resize the canvas viewbox on window resize
       // TODO: Need to implement a proper fix to allow paths to scale
       // window.onresize = _ => {
       //     this.resizeCanvas();
       // };
-      // Prep the canvas for drawing
-      this._element.on("pointerdown", (_) => this._handlePointer());
-      // Stop touch scrolling
-      this._element.on("touchstart", (_) => {
-        if (this._isPen) d3.event.preventDefault();
-      });
-      // Stop the context menu from appearing
-      this._element.on("contextmenu", (_) => {
-        d3.event.preventDefault();
-        d3.event.stopPropagation();
-      });
+      this.addEventListeners();
 
       // Public variables
       // Handles scaling of parent components
       this.parentScale = 1;
-      // Forces the use of the eraser - even if the pen isn't tilted over
-      this.forceEraser = false;
       // Stroke parameters
       this.strokeParam = { ...defStrokeParam, ...strokeParam };
       // Styles for the stroke
@@ -89,16 +202,13 @@ export default class SvgPenSketch {
 
   // Public functions
   getElement() {
-    return this._element.node();
-  }
-  toggleForcedEraser() {
-    this.forceEraser = !this.forceEraser;
+    return this._element;
   }
 
   // Not being used at the moment
   resizeCanvas() {
-    let bbox = this._element.node().getBoundingClientRect();
-    this._element.attr("viewBox", "0 0 " + bbox.width + " " + bbox.height);
+    let bbox = this._element.getBoundingClientRect();
+    this._element.setAttribute("viewBox", "0 0 " + bbox.width + " " + bbox.height);
   }
 
   // Gets the path elements in a specified range
@@ -112,7 +222,7 @@ export default class SvgPenSketch {
       y2 = y + range;
     let paths = [];
 
-    for (let path of this._element.node().querySelectorAll("path")) {
+    for (let path of this._element.querySelectorAll("path")) {
       // Get the bounding boxes for all elements on page
       let bbox = PathExtras.getCachedPathBBox(path);
 
@@ -147,9 +257,8 @@ export default class SvgPenSketch {
       if (
         PathExtras.pathCoordHitTest(pathCoords, x, y, eraserSize).length > 0
       ) {
-        let pathToRemove = d3.select(path);
-        removedPathIDs.push(pathToRemove.attr("id"));
-        pathToRemove.remove();
+        removedPathIDs.push(path.getAttribute("id"));
+        path.remove();
       }
     }
     return removedPathIDs;
@@ -192,10 +301,10 @@ export default class SvgPenSketch {
           let strokePath = this._createPath();
 
           // Copy the styles of the original stroke
-          strokePath.attr("d", this.strokeParam.lineFunc(newPath));
-          strokePath.attr("style", originalPath.getAttribute("style"));
-          strokePath.attr("class", originalPath.getAttribute("class"));
-          pathElements.push(strokePath.node());
+          strokePath.setAttribute("d", this.strokeParam.lineFunc(newPath));
+          strokePath.setAttribute("style", originalPath.getAttribute("style"));
+          strokePath.setAttribute("class", originalPath.getAttribute("class"));
+          pathElements.push(strokePath);
         }
 
         // Remove the original path
@@ -209,26 +318,27 @@ export default class SvgPenSketch {
   // Private functions
   _createEraserHandle(x, y) {
     // Prep the eraser hover element
-    this._eraserHandle = this._element.append("rect");
-    this._eraserHandle.attr("class", "eraserHandle");
-    this._eraserHandle.attr("width", this.eraserParam.eraserSize);
-    this._eraserHandle.attr("height", this.eraserParam.eraserSize);
-    this._eraserHandle.attr("x", x - this.eraserParam.eraserSize / 2);
-    this._eraserHandle.attr("y", y - this.eraserParam.eraserSize / 2);
+    this._eraserHandle = document.createElementNS("http://www.w3.org/2000/svg", "rect");
+    this._eraserHandle.setAttribute("class", "eraserHandle");
+    this._eraserHandle.setAttribute("width", this.eraserParam.eraserSize);
+    this._eraserHandle.setAttribute("height", this.eraserParam.eraserSize);
+    this._eraserHandle.setAttribute("x", x - this.eraserParam.eraserSize / 2);
+    this._eraserHandle.setAttribute("y", y - this.eraserParam.eraserSize / 2);
+    this._element.append(this._eraserHandle);
 
     // Hide the mouse cursor
-    this._element.style("cursor", "none");
+    this._element.style.cursor = "none";
 
     // Apply all user-desired styles
     for (let styleName in this.eraserStyles) {
-      this._eraserHandle.style(styleName, this.eraserStyles[styleName]);
+      this._eraserHandle.style[styleName] = this.eraserStyles[styleName];
     }
   }
 
   _moveEraserHandle(x, y) {
     if (this._eraserHandle) {
-      this._eraserHandle.attr("x", x - this.eraserParam.eraserSize / 2);
-      this._eraserHandle.attr("y", y - this.eraserParam.eraserSize / 2);
+      this._eraserHandle.setAttribute("x", x - this.eraserParam.eraserSize / 2);
+      this._eraserHandle.setAttribute("y", y - this.eraserParam.eraserSize / 2);
     }
   }
 
@@ -236,68 +346,66 @@ export default class SvgPenSketch {
     if (this._eraserHandle) {
       this._eraserHandle.remove();
       this._eraserHandle = null;
-      this._element.style("cursor", null);
+      this._element.style.cursor = null;
     }
+  }
+
+  static eventListeners = [
+    "pointerdown",
+    "touchstart",
+    "contextmenu",
+    "pointermove",
+    //"pointerrawupdate",
+    "pointerup",
+    "pointercancel",
+  ];
+  addEventListeners() {
+    for (const eventType of SvgPenSketch.eventListeners) {
+      this._element.addEventListener(eventType, this);
+    }
+  }
+  removeEventListeners() {
+    for (const eventType of SvgPenSketch.eventListeners) {
+      this._element.removeEventListener(eventType, this);
+    }
+  }
+
+  // Special function called "handleEvent".
+  // This is needed so we can have access to `this`,
+  // while also being able to removeEventListener later.
+  handleEvent(ev) {
+    const fn_name = "_handle_" + ev.type;
+    if (this[fn_name]) return this[fn_name](ev);
+  }
+
+  _handle_touchstart(ev) {
+    // Stop touch scrolling
+    ev.preventDefault();
+  }
+  _handle_contextmenu(ev) {
+    // Stop the context menu from appearing
+    ev.preventDefault();
   }
 
   // Handles the different pointers
   // Also allows for pens to be used on modern browsers
-  _handlePointer() {
-    // If the pointer is a pen - prevent the touch event and run pointer handling code
-    if (d3.event.pointerType == "touch") {
-      this._isPen = false;
-    } else {
-      this._isPen = true;
+  _handle_pointerdown(ev) {
+    const state = new PointerState(ev);
+    this._pointers[state.pointerId] = state;
 
-      let pointerButton = d3.event.button;
-      if (this.forceEraser) pointerButton = 5;
+    console.log(ev.type, ev.pointerType, ev.button, ev.buttons);
+    switch (state.actionName) {
+      case "drawing":
+        state.action = new DrawingAction(this);
+        break;
 
-      // Determine if the pen tip or eraser is being used
-      // ID 0 *should be* the pen tip, with anything else firing the eraser
-      switch (pointerButton) {
-        // Pen
-        case 0:
-          // Create the path/coordinate arrays and set event handlers
-          let penCoords = [];
-          let strokePath = this._createPath();
-
-          // Create the drawing event handlers
-          this._element.on("pointermove", (_) =>
-            this._handleDownEvent((_) => this._onDraw(strokePath, penCoords))
-          );
-          this._element.on("pointerup", (_) =>
-            this._handleUpEvent((_) => this._stopDraw(strokePath, penCoords))
-          );
-          this._element.on("pointerleave", (_) =>
-            this._handleUpEvent((_) => this._stopDraw(strokePath, penCoords))
-          );
-          break;
-
-        // Eraser
-        default:
-        case 5:
-          // Create the location arrays
-          let [x, y] = this._getMousePos(d3.event);
-          let eraserCoords = [[x, y]];
-
-          // Create the eraser handle
-          this._createEraserHandle(x, y);
-
-          // Call the eraser event once for the initial on-click
-          this._handleDownEvent((_) => this._onErase(eraserCoords));
-
-          // Create the erase event handlers
-          this._element.on("pointermove", (_) => {
-            this._handleDownEvent((_) => this._onErase(eraserCoords));
-          });
-          this._element.on("pointerup", (_) =>
-            this._handleUpEvent((_) => this._stopErase())
-          );
-          this._element.on("pointerleave", (_) =>
-            this._handleUpEvent((_) => this._stopErase())
-          );
-          break;
-      }
+      case "erasing":
+        state.action = new ErasingAction(this);
+        break;
+    }
+    if (state.action) {
+      state.action.start(state, ev);
+      ev.preventDefault();
     }
   }
 
@@ -325,104 +433,136 @@ export default class SvgPenSketch {
     ];
 
     for (let feat of features) {
-      newEvent[feat] = d3.event[feat];
+      newEvent[feat] = ev[feat];
     }
     return newEvent;
   }
 
   // Handles the creation of this._currPointerEvent and this._prevPointerEvent
   // Also interpolates between events if needed to keep a particular sample rate
-  _handleDownEvent(callback) {
-    if (this._prevPointerEvent) {
-      let timeDelta = d3.event.timeStamp - this._prevPointerEvent.timeStamp;
-
-      if (timeDelta > this.strokeParam.maxTimeDelta * 2) {
-        // Calculate how many interpolated samples we need
-        let numSteps =
-          Math.floor(timeDelta / this.strokeParam.maxTimeDelta) + 1;
-        let step = timeDelta / numSteps / timeDelta;
-
-        // For each step
-        for (let i = step; i < 1; i += step) {
-          // Make a new event based on the current event
-          let newEvent = this._createEvent();
-          for (let feat in newEvent) {
-            // For every feature (that is a number)
-            if (!isNaN(parseFloat(newEvent[feat]))) {
-              // Linearly interpolate it
-              newEvent[feat] = MathExtas.lerp(
-                this._prevPointerEvent[feat],
-                newEvent[feat],
-                i
-              );
-            }
-          }
-          // Set it and call the callback
-          this._currPointerEvent = newEvent;
-          callback();
-        }
+  //_handle_pointerrawupdate(ev) {
+  _handle_pointermove(ev) {
+    if (ev.getCoalescedEvents) {
+      for (const cev of ev.getCoalescedEvents()) {
+        this._handle_pointermove_coalesced(cev);
       }
+    } else {
+      this._handle_pointermove_coalesced(ev);
+    }
+    // FIXME TODO: Somehow, multi-touch isn't working smoothly on Firefox Android. And I don't know why.
+  }
+  _handle_pointermove_coalesced(ev) {
+    const state = this._pointers[ev.pointerId];
+    if (!state || !state.action) {
+      return;
+    }
+    state.action.move(state, ev);
+
+    // Call the callback
+    switch (state.actionName) {
+      case "drawing":
+        this.penDownCallback?.(state.action.svgPath, ev);
+        break;
+      case "erasing":
+        this.eraserDownCallback?.([], ev);  // TODO: pass the affected callbacks
+        break;
     }
 
-    // Call the proper callback with the "real" event
-    this._currPointerEvent = this._createEvent();
-    callback();
-    this._prevPointerEvent = this._currPointerEvent;
+    // if (this._prevPointerEvent) {
+    //   let timeDelta = ev.timeStamp - this._prevPointerEvent.timeStamp;
+
+    //   if (timeDelta > this.strokeParam.maxTimeDelta * 2) {
+    //     // Calculate how many interpolated samples we need
+    //     const numSteps = Math.floor(timeDelta / this.strokeParam.maxTimeDelta) + 1;
+    //     const step = timeDelta / numSteps / timeDelta;
+
+    //     // For each step
+    //     for (let i = step; i < 1; i += step) {
+    //       // Make a new event based on the current event
+    //       let newEvent = this._createEvent(ev);
+    //       for (let feat in newEvent) {
+    //         // For every feature (that is a number)
+    //         if (!isNaN(parseFloat(newEvent[feat]))) {
+    //           // Linearly interpolate it
+    //           newEvent[feat] = MathExtas.lerp(
+    //             this._prevPointerEvent[feat],
+    //             newEvent[feat],
+    //             i
+    //           );
+    //         }
+    //       }
+    //       this._currPointerEvent = newEvent;
+    //       callback();
+    //     }
+    //   }
+    // }
+
+    // // Call the proper callback with the "real" event
+    // this._currPointerEvent = this._createEvent(ev);
+    // callback();
+    // this._prevPointerEvent = this._currPointerEvent;
   }
 
   // Handles the removal of this._currPointerEvent and this._prevPointerEvent
-  _handleUpEvent(callback) {
-    // Run the up callback
-    this._currPointerEvent = this._createEvent();
-    callback();
+  _handle_pointerup(ev) {
+    const state = this._pointers[ev.pointerId];
+    delete this._pointers[ev.pointerId];
+    if (!state || !state.action) {
+      return;
+    }
+    state.action.stop(state, ev);
 
-    // Cleanup the previous pointer events
-    this._prevPointerEvent = null;
-    this._currPointerEvent = null;
+    // Call the callback
+    switch (state.actionName) {
+      case "drawing":
+        this.penUpCallback?.(state.action.svgPath, ev);
+        break;
+      case "erasing":
+        this.eraserUpCallback?.(ev);
+        break;
+    }
   }
+
+  _handle_pointercancel(ev) {
+    // TODO: Delete the path. in this case.
+    const state = this._pointers[ev.pointerId];
+    delete this._pointers[ev.pointerId];
+    if (!state || !state.action) {
+      return;
+    }
+    state.action.stop(state, ev);
+
+    // Call the callback
+    this.penUpCallback?.(state.action.svgPath, ev);
+  }
+
 
   // Creates a new path on the screen
   _createPath() {
-    let strokePath = this._element.append("path");
+    let strokePath = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    this._element.append(strokePath);
 
     // Generate a random ID for the stroke
     let strokeID = Math.random().toString(32).substr(2, 9);
-    strokePath.attr("id", strokeID);
+    strokePath.setAttribute("id", strokeID);
 
     // Apply all user-desired styles
     for (let styleName in this.strokeStyles) {
-      strokePath.style(styleName, this.strokeStyles[styleName]);
+      strokePath.style[styleName] = this.strokeStyles[styleName];
     }
 
     return strokePath;
   }
 
   // Gets the mouse position on the canvas
-  _getMousePos(event) {
-    let canvasContainer = this.getElement().getBoundingClientRect();
+  _getMousePos(ev) {
+    let canvasContainer = this._element.getBoundingClientRect();
 
     // Calculate the offset using the page location and the canvas' offset (also taking scroll into account)
-    let x =
-        (event.pageX - canvasContainer.x) / this.parentScale - document.scrollingElement.scrollLeft,
-      y = (event.pageY - canvasContainer.y) / this.parentScale - document.scrollingElement.scrollTop;
+    let x = (ev.pageX - canvasContainer.x) / this.parentScale - document.scrollingElement.scrollLeft;
+    let y = (ev.pageY - canvasContainer.y) / this.parentScale - document.scrollingElement.scrollTop;
 
     return [x, y];
-  }
-
-  // Handle the drawing
-  _onDraw(strokePath, penCoords) {
-    if (this._currPointerEvent.pointerType != "touch") {
-      let [x, y] = this._getMousePos(this._currPointerEvent);
-
-      // Add the points to the path
-      penCoords.push([x, y]);
-      strokePath.attr("d", this.strokeParam.lineFunc(penCoords));
-
-      // Call the callback
-      if (this.penDownCallback != undefined) {
-        this.penDownCallback(strokePath.node(), this._currPointerEvent);
-      }
-    }
   }
 
   // Interpolate coordinates in the paths in order to keep a min distance
@@ -461,77 +601,19 @@ export default class SvgPenSketch {
     }
 
     // Update the stroke
-    strokePath.attr("d", this.strokeParam.lineFunc(newPath));
+    strokePath.setAttribute("d", this.strokeParam.lineFunc(newPath));
   }
 
   // Stop the drawing
   _stopDraw(strokePath, penCoords) {
-    // Remove the event handlers
-    this._element.on("pointermove", null);
-    this._element.on("pointerup", null);
-    this._element.on("pointerleave", null);
 
     // Interpolate the path if needed
     this._interpolateStroke(strokePath, penCoords);
 
     // Call the callback
     if (this.penUpCallback != undefined) {
-      this.penUpCallback(strokePath.node(), this._currPointerEvent);
+      this.penUpCallback(strokePath, this._currPointerEvent);
     }
   }
 
-  // Handle the erasing
-  _onErase(eraserCoords) {
-    if (this._currPointerEvent.pointerType != "touch") {
-      let [x, y] = this._getMousePos(this._currPointerEvent);
-      let affectedPaths = null;
-
-      // Move the eraser cursor
-      this._moveEraserHandle(x, y);
-
-      // Add the points
-      eraserCoords.push([x, y]);
-
-      switch (this.eraserParam.eraserMode) {
-        case "object":
-          // Remove any paths in the way
-          affectedPaths = this.removePaths(
-            x,
-            y,
-            this.eraserParam.eraserSize / 2
-          );
-          break;
-        case "pixel":
-          affectedPaths = this.erasePaths(
-            x,
-            y,
-            this.eraserParam.eraserSize / 2
-          );
-          break;
-        default:
-          console.error("ERROR: INVALID ERASER MODE");
-          break;
-      }
-
-      if (this.eraserDownCallback != undefined) {
-        this.eraserDownCallback(affectedPaths, this._currPointerEvent);
-      }
-    }
-  }
-
-  // Stop the erasing
-  _stopErase() {
-    // Remove the eraser icon and add the cursor
-    this._removeEraserHandle();
-
-    // Remove the event handlers
-    this._element.on("pointermove", null);
-    this._element.on("pointerup", null);
-    this._element.on("pointerleave", null);
-
-    // Call the callback
-    if (this.eraserUpCallback != undefined) {
-      this.eraserUpCallback(this._currPointerEvent);
-    }
-  }
 }
