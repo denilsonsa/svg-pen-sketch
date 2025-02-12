@@ -75,7 +75,7 @@ class DrawingAction extends BaseAction {
     this.svgPath = null;
   }
   start(pointerState, ev) {
-    this.svgPath = this.svgPenSketch._createPath();
+    this.svgPath = this.svgPenSketch._createElement("path");
     this._appendMouseCoord(pointerState, ev);
   }
   move(pointerState, ev) {
@@ -87,11 +87,60 @@ class DrawingAction extends BaseAction {
     const [x, y] = this.svgPenSketch._getMousePos(ev);
     this.coords.push([x, y]);
     this.svgPath.setAttribute("d", this.svgPenSketch.strokeParam.lineFunc(this.coords));
-    // TODO: Consider implementing variable stroke width based on the pressure.
-    // This can be implemented by having an outer `<g>` element with multiple `<path>` inside, each one with a different stroke-width.
-    // this.svgPath.style.strokeWidth = (10 * ev.pressure).toFixed(1) + "px";
   }
 }
+
+class PressureDrawingAction extends BaseAction {
+  svgPenSketch;
+  svgGroup;
+  constructor(svgPenSketch) {
+    super();
+    this.svgPenSketch = svgPenSketch;
+    this.svgGroup = null;
+  }
+  start(pointerState, ev) {
+    this.svgGroup = this.svgPenSketch._createElement("g");
+    // TODO: Greatly simplify this logic. Get rid of CSS calc(), and compute everything in just plain JavaScript.
+    const fallbackWidth = this.svgGroup.style.getPropertyValue("stroke-width") || "1px";
+    this.svgGroup.style.setProperty("--min-stroke-width", this.svgGroup.style.getPropertyValue("--min-stroke-width") || `calc(${fallbackWidth} / 2)`);
+    this.svgGroup.style.setProperty("--max-stroke-width", this.svgGroup.style.getPropertyValue("--max-stroke-width") || `calc(${fallbackWidth} * 2)`);
+    this.svgGroup.style.setProperty("stroke-width", "calc(var(--min-stroke-width) + ( var(--max-stroke-width) - var(--min-stroke-width) ) * var(--pressure))");
+    this._appendMouseCoord(pointerState, ev);
+  }
+  move(pointerState, ev) {
+    this._appendMouseCoord(pointerState, ev);
+  }
+  stop(pointerState, ev) {
+  }
+  _appendMouseCoord(pointerState, ev) {
+    const [x, y] = this.svgPenSketch._getMousePos(ev);
+    // 3 digits of precision is good enough for 1000 levels of pressure.
+    // If needed, we can increse it to 4 digits, but that's likely an overkill.
+    const pressure = (ev.pressure === undefined ? 0.5 : +ev.pressure).toFixed(3);
+    console.log(ev.name, ev.type, ev.pressure);
+
+    // TODO: add support for dots (single points with zero length).
+    if (this.coords.length > 0) {
+      // Previous point:
+      const [px, py, pp] = this.coords.at(-1);
+
+      // TODO: reuse the previous path if the pressure amount is the same.
+
+      const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+      // Should we use the current pressure or the last pressure?
+      // Or an average of both?
+      path.style.setProperty("--pressure", pressure);
+      //path.style.setProperty("--pressure", pp);
+      //path.style.setProperty("--pressure", ((+pressure + +pp) / 2).toFixed(3));
+
+      path.setAttribute("d", this.svgPenSketch.strokeParam.lineFunc([[px, py], [x, y]]));
+      this.svgGroup.append(path);
+    }
+
+    this.coords.push([x, y, pressure]);
+  }
+}
+
 
 class ErasingAction extends BaseAction {
   svgPenSketch;
@@ -298,7 +347,7 @@ export default class SvgPenSketch {
         // Add the new paths if they have two or more sets of coordinates
         // Prevents empty paths from being added
         for (let newPath of newPaths) {
-          let strokePath = this._createPath();
+          let strokePath = this._createElement("path");
 
           // Copy the styles of the original stroke
           strokePath.setAttribute("d", this.strokeParam.lineFunc(newPath));
@@ -331,7 +380,7 @@ export default class SvgPenSketch {
 
     // Apply all user-desired styles
     for (let styleName in this.eraserStyles) {
-      this._eraserHandle.style[styleName] = this.eraserStyles[styleName];
+      this._eraserHandle.style.setProperty(styleName, this.eraserStyles[styleName]);
     }
   }
 
@@ -396,7 +445,11 @@ export default class SvgPenSketch {
     console.log(ev.type, ev.pointerType, ev.button, ev.buttons);
     switch (state.actionName) {
       case "drawing":
-        state.action = new DrawingAction(this);
+        if (ev.pressure === undefined) {
+          state.action = new DrawingAction(this);
+        } else {
+          state.action = new PressureDrawingAction(this);
+        }
         break;
 
       case "erasing":
@@ -538,8 +591,8 @@ export default class SvgPenSketch {
 
 
   // Creates a new path on the screen
-  _createPath() {
-    let strokePath = document.createElementNS("http://www.w3.org/2000/svg", "path");
+  _createElement(tagName) {
+    let strokePath = document.createElementNS("http://www.w3.org/2000/svg", tagName);
     this._element.append(strokePath);
 
     // Generate a random ID for the stroke
@@ -548,7 +601,7 @@ export default class SvgPenSketch {
 
     // Apply all user-desired styles
     for (let styleName in this.strokeStyles) {
-      strokePath.style[styleName] = this.strokeStyles[styleName];
+      strokePath.style.setProperty(styleName, this.strokeStyles[styleName]);
     }
 
     return strokePath;
